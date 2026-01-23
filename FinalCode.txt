@@ -1,0 +1,207 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <windows.h>
+#include <cstdio>  
+#include <cstring>
+#include <cstdlib>
+#include <stdlib.h>
+
+//Čitanje sektora sa fizičkog diska (RAW pristup)
+static short ReadSect(const char* _dsk, char* _buff, unsigned int _nsect)  
+
+{
+    DWORD dwRead = 0;
+    //CreateFile() - OTVARANJE DISKA
+    HANDLE hDisk = CreateFileA(
+        _dsk,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL
+    );
+    
+    if (hDisk == INVALID_HANDLE_VALUE) //Neuspešno otvaranje diska (npr. nedovoljne privilegije ili nepostojeći uređaj)
+        return 1;
+
+    LARGE_INTEGER offset{};
+    offset.QuadPart = (LONGLONG)_nsect * 512;
+
+    //POZICIONIRANJE NA ODREĐENI SEKTOR
+    if (!SetFilePointerEx(hDisk, offset, NULL, FILE_BEGIN))
+    {
+        CloseHandle(hDisk);
+        return 2;
+    }
+
+    //SADRŽAJ SEKTORA SE UČITAVA U MEMORIJSKI BAFER
+    if (!ReadFile(hDisk, _buff, 512, &dwRead, 0) || dwRead != 512)   
+    {
+        CloseHandle(hDisk);
+        return 3;
+    }
+
+    CloseHandle(hDisk);
+    return 0;
+}
+
+//Upis sektora na fizički disk (RAW upis)
+static short WriteSect(const char* _dsk, char* _buff, unsigned int _nsect)
+{
+    DWORD dwWritten = 0;
+
+    HANDLE hDisk = CreateFileA(
+        _dsk,
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL
+    );
+
+    if (hDisk == INVALID_HANDLE_VALUE)
+        return 1;
+
+    LARGE_INTEGER offset{};
+    offset.QuadPart = (LONGLONG)_nsect * 512;
+
+    if (!SetFilePointerEx(hDisk, offset, NULL, FILE_BEGIN))
+    {
+        CloseHandle(hDisk);
+        return 2;
+    }
+
+    if (!WriteFile(hDisk, _buff, 512, &dwWritten, NULL) || dwWritten != 512)
+    {
+        CloseHandle(hDisk);
+        return 3;
+    }
+
+    CloseHandle(hDisk);
+    return 0;
+}
+
+//Funkcija koja ispisuje promenu za jedan bajt
+static void PrintByteChange(const unsigned char* before, const unsigned char* after, int idx)
+{
+    printf("Promena na offsetu %d: PRE=%02X  POSLE=%02X\n",
+        idx, before[idx], after[idx]);
+}
+
+//Funkcija koja ispisuje sve promene u sektoru
+static void PrintAllChanges(const unsigned char* before, const unsigned char* after, int size)
+{
+    int changes = 0;
+    for (int i = 0; i < size; i++)
+    {
+        if (before[i] != after[i])
+        {
+            printf("Offset %3d: %02X -> %02X\n", i, before[i], after[i]);
+            changes++;
+        }
+    }
+    if (changes == 0) printf("Nema promena u sektoru.\n");
+}
+
+//Kreiranje direktorijuma za čuvanje rezervne kopije (backup)
+static void CreatBackupFolder()
+{
+    //Nije problem ako direktorijum već postoji
+    CreateDirectoryA("C:\\MBR_Backup", NULL);
+}
+
+//Funkcija za backup - Backup MBR sektora (LBA 0) u binarni fajl (mbr_before.bin)
+static void BackupSector(const char* path, const unsigned char* buff)
+{
+    if (!path || !buff) return;
+
+    FILE* f = nullptr;
+
+    if (fopen_s(&f, path, "wb") != 0 || !f)
+    {
+        printf("Ne mogu da napravim backup fajl!\n");
+        return;
+    }
+
+    fwrite(buff, 1, 512, f);
+    fclose(f);
+
+    printf("Backup sacuvan u: %s\n", path);
+}
+
+
+int main()
+{
+    //Parametri izmene (offset i ciljni uređaj)
+    const int PART_TYPE_OFFSET = 450; // 0x1C2 – Offset polja Partition Type za prvu particiju u MBR-u: 446 B + 4 B = 450
+    const char* dsk = "\\\\.\\PhysicalDrive1"; // Putanja do fizičkog diska se ručno podešava u kodu (PhysicalDrive0/1/2...)
+    unsigned int sector = 0;
+
+    //Čuvanje kopije sektora pre izmene
+    unsigned char* buff = new unsigned char[512];
+
+    short res = ReadSect(dsk, (char*)buff, sector);
+
+    if (res != 0)
+    {
+        printf("Greska pri citanju sektora! Kod: %d\n", res);
+        delete[] buff;
+        return 1;
+    }
+
+    unsigned char before[512];
+    memcpy(before, buff, 512);
+
+    //Prikaz bajta pre izmene
+    unsigned char oldValue = (unsigned char)buff[PART_TYPE_OFFSET];
+
+    printf("\nPRIKAZ BOOT SEKTORA PRE SKRIVANJA PARTICIJE:\n\n");
+    for (int i = 0; i < 512; i++)
+    {
+        printf("%02X ", (unsigned char)buff[i]);
+
+        if ((i + 1) % 16 == 0)
+            printf("\n");
+    }
+
+    printf("\nBAJT KOJI CE SE MENJATI:\n");
+    printf("Offset %d (0x%X)\n", PART_TYPE_OFFSET, PART_TYPE_OFFSET);
+    printf("Vrednost PRE izmene: 0x%02X\n", oldValue);
+
+    //Kreiranje direktorijuma i čuvanje rezervne kopije MBR sektora (pre izmene)
+    CreatBackupFolder();
+    BackupSector("C:\\MBR_Backup\\mbr_before.bin", before);
+
+     
+    //Izmena sadržaja MBR bafera – promena Partition Type polja
+    buff[PART_TYPE_OFFSET] = 0x17; //Izmena Partition Type polja: 0x07 (NTFS) → 0x17 (skrivena NTFS particija)
+  
+    //Upis izmenjenog MBR sektora na fizički disk
+    short wres = WriteSect(dsk, (char*)buff, sector);
+    if (wres != 0)
+    {
+        printf("Greska pri upisu sektora! Kod: %d\n", wres);
+        delete[] buff;
+        return 1;
+    }
+
+    //PRIKAZ POSLE IZMENE
+    printf("\nPRIKAZ BOOT SEKTORA NAKON SKRIVANJA PARTICIJE:\n\n");
+
+    for (int i = 0; i < 512; i++)
+    {
+        printf("%02X ", (unsigned char)buff[i]);
+
+        if ((i + 1) % 16 == 0)
+            printf("\n");
+    }
+
+    printf("\nPRIKAZ POSLE IZMENE:\n\n");
+
+    PrintByteChange(before, buff, PART_TYPE_OFFSET); //Verifikacija izmene: prikaz promene Partition Type bajta na definisanom offsetu
+    PrintAllChanges(before, (unsigned char*)buff, 512); //Provera integriteta: poređenje kompletnog MBR sektora pre i posle izmene
+
+    delete[] buff;
+    return 0;
+}
